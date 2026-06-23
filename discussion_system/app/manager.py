@@ -972,18 +972,114 @@ _STATE_BLOCK_RE = re.compile(
     r"<!--\s*AGORA-STATE-V1\n([A-Za-z0-9+/=\s]+?)\n-->", re.DOTALL)
 
 
-def render_transcript_with_state(state: DiscussionState) -> str:
-    """기록 문서 + 복원용 상태 블록.
+# --- 초소형 복원 힌트(A2, 바이너리 v3) ----------------------------------------
+# 예전 V1 은 전체 상태(모든 발언 원문)를 base64(JSON) 로 통째 심어 .md 끝이 비대했다
+# (발언량에 비례). 본문 자체가 이미 완전한 사람용 기록이고 '불러오기' 는 읽기 전용
+# 이므로, 본문을 파서로 복원하고 본문에서 못 얻는 최소치만 압축 바이너리로 남긴다:
+#   · 에이전트별 persona_type(말풍선 색 — 본문에 없는 유일한 표시 정보)
+#   · 발언별 길이 앵커 — 발언 본문에 구조 마커(`## `,`### `)가 섞여 파싱이 흔들려도,
+#     각 발언이 대략 몇 글자인지 알면 경계를 길이로 되찾는다(예산 지난 첫 마커에서 컷).
+# 압축 3종(블록 84→~48자): ① format_id 는 본문(`- 형식: …(`id`)`)에 있으니 빼고,
+# ② persona 인덱스는 4비트씩 니블 패킹, ③ 발언 길이는 32자 단위로 양자화(1바이트).
+# 블록 크기는 토론 길이가 아니라 (에이전트+발언) 수에만 비례하고, base64 라 안 읽힌다.
+_PERSONA_TABLE = [
+    "ideator", "builder", "critic", "synthesizer", "pragmatist", "neutral",
+    "proponent", "opponent", "fact_checker", "mediator", "analyst",
+]  # 인덱스=enum 선언 순서(0~10). 니블 0xF=미상. 클라이언트의 같은 표와 일치해야 한다.
+_LEN_SHIFT = 5   # 발언 길이 양자화 단위 = 2**5 = 32자 (앵커는 근사 하한이면 충분)
 
-    사람이 읽는 마크다운 본문은 ``render_transcript`` 그대로 두고, 끝에 전체
-    ``DiscussionState`` 를 base64(JSON) HTML 주석으로 심는다 — .md 파일 하나가
-    사람용 기록이자 기계용 완전 복원 소스가 된다(별도 sidecar 파일 불필요).
-    base64 인코딩은 본문에 '-->' 같은 문자가 들어가 주석이 깨지는 것을 막는다.
+
+def _write_uvarint(buf: bytearray, n: int) -> None:
+    """부호 없는 LEB128 varint 를 buf 에 덧붙인다 (발언 길이용 — 가변 1~N바이트)."""
+    n = int(n)
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        buf.append(b | 0x80 if n else b)
+        if not n:
+            return
+
+
+def _read_uvarint(raw: bytes, pos: int) -> tuple[int, int]:
+    """raw[pos:] 에서 uvarint 하나를 읽어 (값, 다음 pos) 반환 (역직렬화 검증용)."""
+    result = shift = 0
+    while True:
+        b = raw[pos]
+        pos += 1
+        result |= (b & 0x7F) << shift
+        if not (b & 0x80):
+            return result, pos
+        shift += 7
+
+
+def _ordered_turn_contents(state: DiscussionState) -> list[str]:
+    """본문이 발언을 펼치는 것과 '같은 순서' 로 발언 원문을 모은다 (길이 앵커 정렬용)."""
+    fmt = _format_of(state)
+    out: list[str] = []
+    for _spec, _rnd, key in _instances_in_order(fmt, state):
+        out.extend(turn.content for turn in state.phase_records.get(key, []))
+    return out
+
+
+def encode_meta_hint(state: DiscussionState) -> str:
+    """복원 힌트를 압축 바이너리로 만들어 base64 문자열로 반환한다.
+
+    레이아웃(바이트): [버전=3][acount][persona 니블 × ⌈acount/2⌉]
+    [발언수 varint][양자화 길이(len>>5, 1바이트) × 발언수]. 니블 0xF=persona 미상.
     """
-    payload = base64.b64encode(
-        state.model_dump_json().encode("utf-8")).decode("ascii")
-    return (render_transcript(state)
-            + f"\n<!-- AGORA-STATE-V1\n{payload}\n-->\n")
+    buf = bytearray([3])
+    agents = state.agents[:255]
+    buf.append(len(agents))
+    idxs = []
+    for a in agents:
+        try:
+            idxs.append(_PERSONA_TABLE.index(a.persona_type))
+        except ValueError:
+            idxs.append(0xF)
+    for i in range(0, len(idxs), 2):          # persona 인덱스 2개 → 1바이트(니블)
+        hi = idxs[i] & 0xF
+        lo = (idxs[i + 1] & 0xF) if i + 1 < len(idxs) else 0xF
+        buf.append((hi << 4) | lo)
+    contents = _ordered_turn_contents(state)
+    _write_uvarint(buf, len(contents))
+    for content in contents:
+        buf.append(min(len(content) >> _LEN_SHIFT, 255))   # 양자화 길이 앵커
+    return base64.b64encode(bytes(buf)).decode("ascii")
+
+
+def decode_meta_hint(b64: str) -> Optional[dict]:
+    """encode_meta_hint(v3) 의 역연산. 알 수 없는 버전이면 None.
+
+    lens 는 양자화 하한(q<<5)으로 복원된다 — 정확한 길이가 아니라 '이 발언은 최소
+    이만큼' 이라는 컷 예산값이다(실제 길이보다 0~31자 작음).
+    """
+    raw = base64.b64decode(b64)
+    if not raw or raw[0] != 3:
+        return None
+    pos = 1
+    acount = raw[pos]; pos += 1
+    idxs: list[int] = []
+    for _ in range((acount + 1) // 2):
+        byte = raw[pos]; pos += 1
+        idxs.append((byte >> 4) & 0xF)
+        idxs.append(byte & 0xF)
+    idxs = idxs[:acount]
+    types = [_PERSONA_TABLE[i] if i < len(_PERSONA_TABLE) else None for i in idxs]
+    tcount, pos = _read_uvarint(raw, pos)
+    lens = []
+    for _ in range(tcount):
+        lens.append(raw[pos] << _LEN_SHIFT); pos += 1
+    return {"version": raw[0], "types": types, "lens": lens}
+
+
+def render_transcript_with_meta(state: DiscussionState) -> str:
+    """기록 문서(사람용) + 초소형 복원 힌트(A2) 한 줄.
+
+    본문은 ``render_transcript`` 그대로 두고, 끝에 ``encode_meta_hint`` 결과를
+    ``<!-- A2 ... -->`` 주석으로 단다. 본문이 복원의 1차 소스이고, 이 힌트는
+    persona 색과 발언 길이 앵커만 보강한다 — 발언 원문을 중복 저장하지 않는다.
+    """
+    return render_transcript(state) + f"\n<!-- A2 {encode_meta_hint(state)} -->\n"
 
 
 def extract_embedded_state(markdown: str) -> Optional[DiscussionState]:
@@ -1011,7 +1107,7 @@ def archive_transcript(state: DiscussionState) -> str:
     os.makedirs(directory, exist_ok=True)
     path = os.path.join(directory, f"agora-{state.discussion_id[:8]}.md")
     with open(path, "w", encoding="utf-8") as fh:
-        fh.write(render_transcript_with_state(state))
+        fh.write(render_transcript_with_meta(state))
     return path
 
 

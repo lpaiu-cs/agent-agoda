@@ -1,4 +1,7 @@
 """manager.py 순수 헬퍼 — 환경변수 파싱, 시스템 LLM 에이전트 선택, 합의 근접도."""
+import base64
+import re
+
 import pytest
 
 from app import manager
@@ -10,9 +13,10 @@ from app.manager import (
     _positive_int_env,
     _render_convergence_trajectory,
     _split_reasoning_draft,
+    decode_meta_hint,
     extract_embedded_state,
     render_transcript,
-    render_transcript_with_state,
+    render_transcript_with_meta,
     total_token_usage,
 )
 from app.schemas import (
@@ -162,7 +166,7 @@ def test_total_token_usage_counts_turns_and_facilitator_notes():
 
 
 # ---------------------------------------------------------------------------
-# .md 내장 상태 블록 — 저장·복원 라운드트립
+# .md 복원 힌트(A2) — 초소형 인코딩 + 길이 앵커 / 옛 V1 블록 하위호환
 # ---------------------------------------------------------------------------
 def _rich_state():
     """본문에 '-->'·마크다운 헤더 같은 함정 문자를 넣은 상태 (블록 견고성 검증)."""
@@ -178,19 +182,38 @@ def _rich_state():
     return state
 
 
-def test_transcript_state_block_round_trip():
-    doc = render_transcript_with_state(_rich_state())
-    assert "AGORA-STATE-V1" in doc
-    # 사람용 본문은 그대로 시작하고, 상태 블록은 끝의 HTML 주석이다.
-    assert doc.startswith(render_transcript(_rich_state())[:50])
+def test_meta_hint_round_trip():
+    state = _rich_state()
+    doc = render_transcript_with_meta(state)
+    # 사람용 본문은 그대로 시작하고, 힌트는 끝의 한 줄 HTML 주석(A2)이다.
+    assert doc.startswith(render_transcript(state)[:50])
+    block = doc[doc.index("<!-- A2 "):]
+    # 발언 원문을 중복 저장하지 않으므로 블록은 본문 대비 아주 짧다.
+    assert "\n" not in block.strip() and len(block) < 200
+    payload = re.search(r"<!-- A2 (\S+) -->", doc).group(1)
+    meta = decode_meta_hint(payload)
+    assert "fmt" not in meta                       # format_id 는 본문에서 읽으므로 미포함
+    assert meta["types"] == [a.persona_type for a in state.agents]
+    # 길이 앵커 = 본문 순서대로의 발언 길이를 32자 단위로 양자화한 하한값.
+    sh = manager._LEN_SHIFT
+    contents = manager._ordered_turn_contents(state)
+    assert meta["lens"] == [(len(c) >> sh) << sh for c in contents]
+
+
+def test_decode_meta_hint_rejects_unknown_version():
+    # v3 외 버전(예: 손상/구버전 바이트)은 None 으로 조용히 폴백.
+    assert decode_meta_hint(base64.b64encode(bytes([2, 0, 0])).decode()) is None
+
+
+def test_legacy_v1_block_still_decodes():
+    """예전 V1 전체상태 블록이 든 .md 는 그대로 완벽 복원된다(하위 호환)."""
+    state = _rich_state()
+    payload = base64.b64encode(state.model_dump_json().encode()).decode("ascii")
+    doc = render_transcript(state) + f"\n<!-- AGORA-STATE-V1\n{payload}\n-->\n"
     restored = extract_embedded_state(doc)
     assert restored is not None
-    assert restored.topic == "## 마크다운 주제\n화살표 A --> B 도 있다"
     assert restored.phase_records["opinion"][0].content == "## 헤더 발언 --> 끝"
-    assert restored.phase_records["opinion"][0].metadata["usage"][
-        "completion_tokens"] == 7
     assert restored.phase_summaries[0].convergence_score == 0.7
-    assert restored.facilitator_notes[0].kind == "between"
     assert [a.agent_id for a in restored.agents] == ["a0", "a1"]
 
 
