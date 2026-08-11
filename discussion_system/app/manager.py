@@ -972,7 +972,7 @@ _STATE_BLOCK_RE = re.compile(
     r"<!--\s*AGORA-STATE-V1\n([A-Za-z0-9+/=\s]+?)\n-->", re.DOTALL)
 
 
-# --- 초소형 복원 힌트(A2, 바이너리 v3) ----------------------------------------
+# --- 초소형 복원 힌트(A2, 바이너리 v4) ----------------------------------------
 # 예전 V1 은 전체 상태(모든 발언 원문)를 base64(JSON) 로 통째 심어 .md 끝이 비대했다
 # (발언량에 비례). 본문 자체가 이미 완전한 사람용 기록이고 '불러오기' 는 읽기 전용
 # 이므로, 본문을 파서로 복원하고 본문에서 못 얻는 최소치만 압축 바이너리로 남긴다:
@@ -980,15 +980,12 @@ _STATE_BLOCK_RE = re.compile(
 #   · 발언별 길이 앵커 — 발언 본문에 구조 마커(`## `,`### `)가 섞여 파싱이 흔들려도,
 #     각 발언이 대략 몇 글자인지 알면 경계를 길이로 되찾는다(예산 지난 첫 마커에서 컷).
 # 압축 3종(블록 84→~48자): ① format_id 는 본문(`- 형식: …(`id`)`)에 있으니 빼고,
-# ② persona 인덱스는 4비트씩 니블 패킹, ③ 발언 길이는 32자 단위로 양자화(1바이트).
+# ② persona 인덱스는 4비트씩 니블 패킹, ③ 발언 길이는 정확한 varint로 기록한다.
 # 블록 크기는 토론 길이가 아니라 (에이전트+발언) 수에만 비례하고, base64 라 안 읽힌다.
 _PERSONA_TABLE = [
     "ideator", "builder", "critic", "synthesizer", "pragmatist", "neutral",
     "proponent", "opponent", "fact_checker", "mediator", "analyst",
 ]  # 인덱스=enum 선언 순서(0~10). 니블 0xF=미상. 클라이언트의 같은 표와 일치해야 한다.
-_LEN_SHIFT = 5   # 발언 길이 양자화 단위 = 2**5 = 32자 (앵커는 근사 하한이면 충분)
-
-
 def _write_uvarint(buf: bytearray, n: int) -> None:
     """부호 없는 LEB128 varint 를 buf 에 덧붙인다 (발언 길이용 — 가변 1~N바이트)."""
     n = int(n)
@@ -1024,10 +1021,13 @@ def _ordered_turn_contents(state: DiscussionState) -> list[str]:
 def encode_meta_hint(state: DiscussionState) -> str:
     """복원 힌트를 압축 바이너리로 만들어 base64 문자열로 반환한다.
 
-    레이아웃(바이트): [버전=3][acount][persona 니블 × ⌈acount/2⌉]
-    [발언수 varint][양자화 길이(len>>5, 1바이트) × 발언수]. 니블 0xF=persona 미상.
+    레이아웃(바이트): [버전=4][acount][persona 니블 × ⌈acount/2⌉]
+    [발언수 varint][정확한 길이 varint × 발언수]. 니블 0xF=persona 미상.
+
+    길이를 근사 하한으로 저장하면 본문 말미의 Markdown 구조 마커를 실제 경계로
+    오인할 수 있으므로, 복원 경계를 결정하는 값만큼은 정확히 보존한다.
     """
-    buf = bytearray([3])
+    buf = bytearray([4])
     agents = state.agents[:255]
     buf.append(len(agents))
     idxs = []
@@ -1043,18 +1043,14 @@ def encode_meta_hint(state: DiscussionState) -> str:
     contents = _ordered_turn_contents(state)
     _write_uvarint(buf, len(contents))
     for content in contents:
-        buf.append(min(len(content) >> _LEN_SHIFT, 255))   # 양자화 길이 앵커
+        _write_uvarint(buf, len(content))
     return base64.b64encode(bytes(buf)).decode("ascii")
 
 
 def decode_meta_hint(b64: str) -> Optional[dict]:
-    """encode_meta_hint(v3) 의 역연산. 알 수 없는 버전이면 None.
-
-    lens 는 양자화 하한(q<<5)으로 복원된다 — 정확한 길이가 아니라 '이 발언은 최소
-    이만큼' 이라는 컷 예산값이다(실제 길이보다 0~31자 작음).
-    """
+    """encode_meta_hint(v4) 의 역연산. 기존 v3 힌트도 읽기 호환한다."""
     raw = base64.b64decode(b64)
-    if not raw or raw[0] != 3:
+    if not raw or raw[0] not in (3, 4):
         return None
     pos = 1
     acount = raw[pos]; pos += 1
@@ -1068,8 +1064,14 @@ def decode_meta_hint(b64: str) -> Optional[dict]:
     tcount, pos = _read_uvarint(raw, pos)
     lens = []
     for _ in range(tcount):
-        lens.append(raw[pos] << _LEN_SHIFT); pos += 1
-    return {"version": raw[0], "types": types, "lens": lens}
+        if raw[0] == 3:
+            # 이미 저장된 v3 파일을 위한 읽기 호환. 이 값은 근사 하한이다.
+            lens.append(raw[pos] << 5); pos += 1
+        else:
+            length, pos = _read_uvarint(raw, pos)
+            lens.append(length)
+    return {"version": raw[0], "types": types, "lens": lens,
+            "exact_lengths": raw[0] == 4}
 
 
 def render_transcript_with_meta(state: DiscussionState) -> str:

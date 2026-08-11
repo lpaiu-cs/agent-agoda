@@ -14,6 +14,7 @@ from app.manager import (
     _render_convergence_trajectory,
     _split_reasoning_draft,
     decode_meta_hint,
+    encode_meta_hint,
     extract_embedded_state,
     render_transcript,
     render_transcript_with_meta,
@@ -166,7 +167,7 @@ def test_total_token_usage_counts_turns_and_facilitator_notes():
 
 
 # ---------------------------------------------------------------------------
-# .md 복원 힌트(A2) — 초소형 인코딩 + 길이 앵커 / 옛 V1 블록 하위호환
+# .md 복원 힌트(A2) — 초소형 인코딩 + 정확한 길이 앵커 / 옛 V1 블록 하위호환
 # ---------------------------------------------------------------------------
 def _rich_state():
     """본문에 '-->'·마크다운 헤더 같은 함정 문자를 넣은 상태 (블록 견고성 검증)."""
@@ -194,10 +195,20 @@ def test_meta_hint_round_trip():
     meta = decode_meta_hint(payload)
     assert "fmt" not in meta                       # format_id 는 본문에서 읽으므로 미포함
     assert meta["types"] == [a.persona_type for a in state.agents]
-    # 길이 앵커 = 본문 순서대로의 발언 길이를 32자 단위로 양자화한 하한값.
-    sh = manager._LEN_SHIFT
+    # 길이 앵커 = 본문 순서대로의 정확한 코드포인트 길이.
     contents = manager._ordered_turn_contents(state)
-    assert meta["lens"] == [(len(c) >> sh) << sh for c in contents]
+    assert meta["version"] == 4
+    assert meta["exact_lengths"] is True
+    assert meta["lens"] == [len(c) for c in contents]
+
+
+def test_meta_hint_keeps_exact_long_turn_length():
+    """8K를 넘는 발언도 A2 앵커가 포화·절단되지 않는다."""
+    state = _rich_state()
+    content = "앞부분\n## 본문 안의 헤더\n" + "x" * 9_000
+    state.phase_records["opinion"][0].content = content
+    meta = decode_meta_hint(encode_meta_hint(state))
+    assert meta["lens"] == [len(content)]
 
 
 def test_decode_meta_hint_rejects_unknown_version():
